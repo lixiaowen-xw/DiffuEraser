@@ -4,7 +4,6 @@ import numpy as np
 import PIL.Image
 from einops import rearrange, repeat
 from dataclasses import dataclass
-import copy
 import torch
 import torch.nn.functional as F
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
@@ -27,17 +26,13 @@ from diffusers.utils.torch_utils import is_compiled_module, is_torch_version, ra
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline, StableDiffusionMixin
 from diffusers.pipelines.stable_diffusion.pipeline_output import StableDiffusionPipelineOutput
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
-from diffusers import (
-    AutoencoderKL,
-    DDPMScheduler,
-    UniPCMultistepScheduler,
-)
 
 from libs.unet_2d_condition import UNet2DConditionModel
 from libs.brushnet_CA import BrushNetModel
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
 
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.retrieve_timesteps
 def retrieve_timesteps(
@@ -83,36 +78,11 @@ def retrieve_timesteps(
         timesteps = scheduler.timesteps
     return timesteps, num_inference_steps
 
-def get_frames_context_swap(total_frames=192, overlap=4, num_frames_per_clip=24):
-    if total_frames<num_frames_per_clip:
-        num_frames_per_clip = total_frames
-    context_list = []
-    context_list_swap = []
-    for i in range(1, 2):  # i=1
-        sample_interval = np.array(range(0,total_frames,i))
-        n = len(sample_interval)
-        if n>num_frames_per_clip:
-            ## [0,num_frames_per_clip-1], [num_frames_per_clip, 2*num_frames_per_clip-1]....
-            for k in range(0,n-num_frames_per_clip,num_frames_per_clip-overlap):
-                context_list.append(sample_interval[k:k+num_frames_per_clip])
-            if k+num_frames_per_clip < n and i==1:
-                context_list.append(sample_interval[n-num_frames_per_clip:n])
-            context_list_swap.append(sample_interval[0:num_frames_per_clip])
-            for k in range(num_frames_per_clip//2, n-num_frames_per_clip, num_frames_per_clip-overlap):
-                context_list_swap.append(sample_interval[k:k+num_frames_per_clip])
-            if k+num_frames_per_clip < n and i==1:
-                context_list_swap.append(sample_interval[n-num_frames_per_clip:n])
-        if n==num_frames_per_clip:
-            context_list.append(sample_interval[n-num_frames_per_clip:n])
-            context_list_swap.append(sample_interval[n-num_frames_per_clip:n])
-    return context_list, context_list_swap
-
 @dataclass
-class DiffuEraserPipelineOutput(BaseOutput):
+class DiffuEraserPipelineStageTwoOutput(BaseOutput):
     frames: Union[torch.Tensor, np.ndarray]
-    latents: Union[torch.Tensor, np.ndarray]
 
-class StableDiffusionDiffuEraserPipeline(
+class StableDiffusionDiffuEraserPipelineStageTwo(
     DiffusionPipeline,
     StableDiffusionMixin,
     TextualInversionLoaderMixin,
@@ -121,7 +91,7 @@ class StableDiffusionDiffuEraserPipeline(
     FromSingleFileMixin,
 ):
     r"""
-    Pipeline for video inpainting using Video Diffusion Model with BrushNet guidance.
+    Pipeline for video inpainting using Video Diffusion Model with BrushNet guidance. Stage2.
 
     This model inherits from [`DiffusionPipeline`]. Check the superclass documentation for the generic methods
     implemented for all pipelines (downloading, saving, running on a particular device, etc.).
@@ -523,7 +493,6 @@ class StableDiffusionDiffuEraserPipeline(
                 images=image, clip_input=safety_checker_input.pixel_values.to(dtype)
             )
         return image, has_nsfw_concept
-
     # Copied from diffusers.pipelines.text_to_video_synthesis/pipeline_text_to_video_synth.TextToVideoSDPipeline.decode_latents
     def decode_latents(self, latents, weight_dtype):
         latents = 1 / self.vae.config.scaling_factor * latents
@@ -785,13 +754,6 @@ class StableDiffusionDiffuEraserPipeline(
         # scale the initial noise by the standard deviation required by the scheduler
         latents = noise * self.scheduler.init_noise_sigma
         return latents, noise
-    
-    @staticmethod
-    def temp_blend(a, b, overlap):
-        factor = torch.arange(overlap).to(b.device).view(overlap, 1, 1, 1) / (overlap - 1)
-        a[:overlap, ...] = (1 - factor) * a[:overlap, ...] + factor * b[:overlap, ...]
-        a[overlap:, ...] = b[overlap:, ...]
-        return a
 
     # Copied from diffusers.pipelines.latent_consistency_models.pipeline_latent_consistency_text2img.LatentConsistencyModelPipeline.get_guidance_scale_embedding
     def get_guidance_scale_embedding(self, w, embedding_dim=512, dtype=torch.float32):
@@ -887,10 +849,24 @@ class StableDiffusionDiffuEraserPipeline(
                 The prompt or prompts to guide image generation. If not defined, you need to pass `prompt_embeds`.
             images (`torch.FloatTensor`, `PIL.Image.Image`, `np.ndarray`, `List[torch.FloatTensor]`, `List[PIL.Image.Image]`, `List[np.ndarray]`,:
                     `List[List[torch.FloatTensor]]`, `List[List[np.ndarray]]` or `List[List[PIL.Image.Image]]`):
-                The BrushNet branch input condition to provide guidance to the `unet` for generation. 
+                The BrushNet input condition to provide guidance to the `unet` for generation. If the type is
+                specified as `torch.FloatTensor`, it is passed to BrushNet as is. `PIL.Image.Image` can also be
+                accepted as an image. The dimensions of the output image defaults to `image`'s dimensions. If height
+                and/or width are passed, `image` is resized accordingly. If multiple BrushNets are specified in
+                `init`, images must be passed as a list such that each element of the list can be correctly batched for
+                input to a single BrushNet. When `prompt` is a list, and if a list of images is passed for a single BrushNet,
+                each will be paired with each prompt in the `prompt` list. This also applies to multiple BrushNets,
+                where a list of image lists can be passed to batch for each prompt and each BrushNet.
             masks (`torch.FloatTensor`, `PIL.Image.Image`, `np.ndarray`, `List[torch.FloatTensor]`, `List[PIL.Image.Image]`, `List[np.ndarray]`,:
                     `List[List[torch.FloatTensor]]`, `List[List[np.ndarray]]` or `List[List[PIL.Image.Image]]`):
-                The BrushNet branch input condition to provide guidance to the `unet` for generation. 
+                The BrushNet input condition to provide guidance to the `unet` for generation. If the type is
+                specified as `torch.FloatTensor`, it is passed to BrushNet as is. `PIL.Image.Image` can also be
+                accepted as an image. The dimensions of the output image defaults to `image`'s dimensions. If height
+                and/or width are passed, `image` is resized accordingly. If multiple BrushNets are specified in
+                `init`, images must be passed as a list such that each element of the list can be correctly batched for
+                input to a single BrushNet. When `prompt` is a list, and if a list of images is passed for a single BrushNet,
+                each will be paired with each prompt in the `prompt` list. This also applies to multiple BrushNets,
+                where a list of image lists can be passed to batch for each prompt and each BrushNet.
             height (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
                 The height in pixels of the generated image.
             width (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
@@ -1046,7 +1022,6 @@ class StableDiffusionDiffuEraserPipeline(
             else brushnet.nets[0].config.global_pool_conditions
         )
         guess_mode = guess_mode or global_pool_conditions
-        video_length = len(images)
 
         # 3. Encode input prompt
         text_encoder_lora_scale = (
@@ -1132,13 +1107,7 @@ class StableDiffusionDiffuEraserPipeline(
 
         # 6.1 prepare condition latents
         images = torch.cat(images)
-        images = images.to(dtype=images[0].dtype)
-        conditioning_latents = []
-        num=4
-        for i in range(0, images.shape[0], num):
-            conditioning_latents.append(self.vae.encode(images[i : i + num]).latent_dist.sample())
-        conditioning_latents = torch.cat(conditioning_latents, dim=0)
-
+        conditioning_latents=self.vae.encode(images.to(dtype=images[0].dtype)).latent_dist.sample()
         conditioning_latents = conditioning_latents * self.vae.config.scaling_factor  #[(f c h w],c2=4
 
         original_masks = torch.cat(original_masks) 
@@ -1150,7 +1119,12 @@ class StableDiffusionDiffuEraserPipeline(
             )
         ) ##[ f c h w],c=1
 
+        if not guess_mode and self.do_classifier_free_guidance:
+            conditioning_latents =  torch.cat([conditioning_latents] * 2)
+            masks = torch.cat([masks] * 2)
+
         conditioning_latents=torch.concat([conditioning_latents,masks],1)
+
 
         # 6.5 Optionally get Guidance Scale Embedding
         timestep_cond = None
@@ -1179,15 +1153,6 @@ class StableDiffusionDiffuEraserPipeline(
             ]
             brushnet_keep.append(keeps[0] if isinstance(brushnet, BrushNetModel) else keeps)
 
-
-        overlap = num_frames//4
-        context_list, context_list_swap = get_frames_context_swap(video_length, overlap=overlap, num_frames_per_clip=num_frames)
-        scheduler_status = [copy.deepcopy(self.scheduler.__dict__)] * len(context_list)
-        scheduler_status_swap = [copy.deepcopy(self.scheduler.__dict__)] * len(context_list_swap)
-        count = torch.zeros_like(latents)
-        value = torch.zeros_like(latents)
-        
-
         # 8. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         is_unet_compiled = is_compiled_module(self.unet)
@@ -1195,113 +1160,80 @@ class StableDiffusionDiffuEraserPipeline(
         is_torch_higher_equal_2_1 = is_torch_version(">=", "2.1")
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
-                
-                count.zero_()
-                value.zero_()
-                ## swap
-                if (i%2==1):
-                    context_list_choose = context_list_swap
-                    scheduler_status_choose = scheduler_status_swap
+                # Relevant thread:
+                # https://dev-discuss.pytorch.org/t/cudagraphs-in-pytorch-2-0/1428
+                if (is_unet_compiled and is_brushnet_compiled) and is_torch_higher_equal_2_1:
+                    torch._inductor.cudagraph_mark_step_begin()
+                # expand the latents if we are doing classifier free guidance
+                latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
+                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+                # brushnet(s) inference
+                if guess_mode and self.do_classifier_free_guidance:
+                    # Infer BrushNet only for the conditional batch.
+                    control_model_input = latents
+                    control_model_input = self.scheduler.scale_model_input(control_model_input, t)
+                    brushnet_prompt_embeds = prompt_embeds.chunk(2)[1]
+                    brushnet_prompt_embeds = rearrange(repeat(brushnet_prompt_embeds, "b c d -> b t c d", t=num_frames), 'b t c d -> (b t) c d')
                 else:
-                    context_list_choose = context_list
-                    scheduler_status_choose = scheduler_status
-
-
-                for j, context in enumerate(context_list_choose):
-                    self.scheduler.__dict__.update(scheduler_status_choose[j])
-
-                    latents_j = latents[context, :, :, :]
-
-                    # Relevant thread:
-                    # https://dev-discuss.pytorch.org/t/cudagraphs-in-pytorch-2-0/1428
-                    if (is_unet_compiled and is_brushnet_compiled) and is_torch_higher_equal_2_1:
-                        torch._inductor.cudagraph_mark_step_begin()
-                    # expand the latents if we are doing classifier free guidance
-                    latent_model_input = torch.cat([latents_j] * 2) if self.do_classifier_free_guidance else latents_j
-                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-
-                    # brushnet(s) inference
-                    if guess_mode and self.do_classifier_free_guidance:
-                        # Infer BrushNet only for the conditional batch.
-                        control_model_input = latents_j
-                        control_model_input = self.scheduler.scale_model_input(control_model_input, t)
-                        brushnet_prompt_embeds = prompt_embeds.chunk(2)[1]
-                        brushnet_prompt_embeds = rearrange(repeat(brushnet_prompt_embeds, "b c d -> b t c d", t=num_frames), 'b t c d -> (b t) c d')
-                    else:
-                        control_model_input = latent_model_input
-                        brushnet_prompt_embeds = prompt_embeds
-                        if self.do_classifier_free_guidance:
-                            neg_brushnet_prompt_embeds, brushnet_prompt_embeds = brushnet_prompt_embeds.chunk(2)
-                            brushnet_prompt_embeds = rearrange(repeat(brushnet_prompt_embeds, "b c d -> b t c d", t=num_frames), 'b t c d -> (b t) c d')
-                            neg_brushnet_prompt_embeds = rearrange(repeat(neg_brushnet_prompt_embeds, "b c d -> b t c d", t=num_frames), 'b t c d -> (b t) c d')
-                            brushnet_prompt_embeds = torch.cat([neg_brushnet_prompt_embeds, brushnet_prompt_embeds])
-                        else:
-                            brushnet_prompt_embeds = rearrange(repeat(brushnet_prompt_embeds, "b c d -> b t c d", t=num_frames), 'b t c d -> (b t) c d')
-
-                    if isinstance(brushnet_keep[i], list):
-                        cond_scale = [c * s for c, s in zip(brushnet_conditioning_scale, brushnet_keep[i])]
-                    else:
-                        brushnet_cond_scale = brushnet_conditioning_scale
-                        if isinstance(brushnet_cond_scale, list):
-                            brushnet_cond_scale = brushnet_cond_scale[0]
-                        cond_scale = brushnet_cond_scale * brushnet_keep[i]
-
-
-                    down_block_res_samples, mid_block_res_sample, up_block_res_samples = self.brushnet(
-                        control_model_input,
-                        t,
-                        encoder_hidden_states=brushnet_prompt_embeds,
-                        brushnet_cond=torch.cat([conditioning_latents[context, :, :, :]]*2) if self.do_classifier_free_guidance else conditioning_latents[context, :, :, :],
-                        conditioning_scale=cond_scale,
-                        guess_mode=guess_mode,
-                        return_dict=False,
-                    )
-
-                    if guess_mode and self.do_classifier_free_guidance:
-                        # Infered BrushNet only for the conditional batch.
-                        # To apply the output of BrushNet to both the unconditional and conditional batches,
-                        # add 0 to the unconditional batch to keep it unchanged.
-                        down_block_res_samples = [torch.cat([torch.zeros_like(d), d]) for d in down_block_res_samples]
-                        mid_block_res_sample = torch.cat([torch.zeros_like(mid_block_res_sample), mid_block_res_sample])
-                        up_block_res_samples = [torch.cat([torch.zeros_like(d), d]) for d in up_block_res_samples]
-
-                    # predict the noise residual
-                    noise_pred = self.unet(
-                        latent_model_input,
-                        t,
-                        encoder_hidden_states=prompt_embeds,
-                        timestep_cond=timestep_cond,
-                        cross_attention_kwargs=self.cross_attention_kwargs,
-                        down_block_add_samples=down_block_res_samples,
-                        mid_block_add_sample=mid_block_res_sample,
-                        up_block_add_samples=up_block_res_samples,
-                        added_cond_kwargs=added_cond_kwargs,
-                        return_dict=False,
-                        num_frames=num_frames,
-                    )[0]
-
-                    # perform guidance
+                    control_model_input = latent_model_input
+                    brushnet_prompt_embeds = prompt_embeds
                     if self.do_classifier_free_guidance:
-                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                        noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
-
-                    # compute the previous noisy sample x_t -> x_t-1
-                    latents_j = self.scheduler.step(noise_pred, t, latents_j, **extra_step_kwargs, return_dict=False)[0]
-
-                    count[context, ...] += 1
-
-                    if j==0:
-                        value[context, ...] += latents_j
+                        neg_brushnet_prompt_embeds, brushnet_prompt_embeds = brushnet_prompt_embeds.chunk(2)
+                        brushnet_prompt_embeds = rearrange(repeat(brushnet_prompt_embeds, "b c d -> b t c d", t=num_frames), 'b t c d -> (b t) c d')
+                        neg_brushnet_prompt_embeds = rearrange(repeat(neg_brushnet_prompt_embeds, "b c d -> b t c d", t=num_frames), 'b t c d -> (b t) c d')
+                        brushnet_prompt_embeds = torch.cat([neg_brushnet_prompt_embeds, brushnet_prompt_embeds])
                     else:
-                        overlap_index_list = [index for index, value in enumerate(count[context, 0, 0, 0]) if value > 1]
-                        overlap_cur = len(overlap_index_list)
-                        ratio_next = torch.linspace(0, 1, overlap_cur+2)[1:-1]
-                        ratio_pre = 1-ratio_next
-                        for i_overlap in overlap_index_list:
-                            value[context[i_overlap], ...] = value[context[i_overlap], ...]*ratio_pre[i_overlap] + latents_j[i_overlap, ...]*ratio_next[i_overlap]
-                        value[context[i_overlap:num_frames], ...] = latents_j[i_overlap:num_frames, ...]
+                        brushnet_prompt_embeds = rearrange(repeat(brushnet_prompt_embeds, "b c d -> b t c d", t=num_frames), 'b t c d -> (b t) c d')
 
-                latents = value.clone()
+                if isinstance(brushnet_keep[i], list):
+                    cond_scale = [c * s for c, s in zip(brushnet_conditioning_scale, brushnet_keep[i])]
+                else:
+                    brushnet_cond_scale = brushnet_conditioning_scale
+                    if isinstance(brushnet_cond_scale, list):
+                        brushnet_cond_scale = brushnet_cond_scale[0]
+                    cond_scale = brushnet_cond_scale * brushnet_keep[i]
+
+                down_block_res_samples, mid_block_res_sample, up_block_res_samples = self.brushnet(
+                    control_model_input,
+                    t,
+                    encoder_hidden_states=brushnet_prompt_embeds,
+                    brushnet_cond=conditioning_latents,
+                    conditioning_scale=cond_scale,
+                    guess_mode=guess_mode,
+                    return_dict=False,
+                )
+
+                if guess_mode and self.do_classifier_free_guidance:
+                    # Infered BrushNet only for the conditional batch.
+                    # To apply the output of BrushNet to both the unconditional and conditional batches,
+                    # add 0 to the unconditional batch to keep it unchanged.
+                    down_block_res_samples = [torch.cat([torch.zeros_like(d), d]) for d in down_block_res_samples]
+                    mid_block_res_sample = torch.cat([torch.zeros_like(mid_block_res_sample), mid_block_res_sample])
+                    up_block_res_samples = [torch.cat([torch.zeros_like(d), d]) for d in up_block_res_samples]
+
+                # predict the noise residual
+                noise_pred = self.unet(
+                    latent_model_input,
+                    t,
+                    encoder_hidden_states=prompt_embeds,
+                    timestep_cond=timestep_cond,
+                    cross_attention_kwargs=self.cross_attention_kwargs,
+                    down_block_add_samples=down_block_res_samples,
+                    mid_block_add_sample=mid_block_res_sample,
+                    up_block_add_samples=up_block_res_samples,
+                    added_cond_kwargs=added_cond_kwargs,
+                    return_dict=False,
+                    num_frames=num_frames,
+                )[0]
+
+                # perform guidance
+                if self.do_classifier_free_guidance:
+                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+                # compute the previous noisy sample x_t -> x_t-1
+                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
@@ -1320,7 +1252,6 @@ class StableDiffusionDiffuEraserPipeline(
                         step_idx = i // getattr(self.scheduler, "order", 1)
                         callback(step_idx, t, latents)
 
-
         # If we do sequential model offloading, let's offload unet and brushnet
         # manually for max memory savings
         if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
@@ -1331,7 +1262,7 @@ class StableDiffusionDiffuEraserPipeline(
         if  output_type == "latent":
             image = latents
             has_nsfw_concept = None
-            return DiffuEraserPipelineOutput(frames=image, nsfw_content_detected=has_nsfw_concept)
+            return DiffuEraserPipelineStageTwoOutput(frames=image, nsfw_content_detected=has_nsfw_concept)
 
         video_tensor = self.decode_latents(latents, weight_dtype=prompt_embeds.dtype)
 
@@ -1346,4 +1277,4 @@ class StableDiffusionDiffuEraserPipeline(
         if not return_dict:
             return (video, has_nsfw_concept)
 
-        return DiffuEraserPipelineOutput(frames=video, latents=latents)
+        return DiffuEraserPipelineStageTwoOutput(frames=video)

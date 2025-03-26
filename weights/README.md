@@ -19,4 +19,7 @@ weights
       |-diffusion_pytorch_model.bin
       |-...
    |- README.md
+   |- animatediff-motion-adapter-v1-5-2 (Optional)
+      |- diffusion_pytorch_model.safetensors
+      |- ...
 ```
