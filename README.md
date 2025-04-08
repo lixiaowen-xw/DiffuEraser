@@ -22,6 +22,7 @@
         <a href="https://arxiv.org/abs/2501.10018" target='_blank'><img src="https://img.shields.io/badge/arXiv-2501.10018-B31B1B.svg"></a>
         <a href="https://huggingface.co/lixiaowen/diffuEraser"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model-blue"></a>
         <a href="https://www.modelscope.cn/xingzi/diffuEraser"><img src="https://img.shields.io/badge/%20Modelscope-Model-orange"></a>
+        <a href="https://www.modelscope.cn/studios/iic/DiffuEraser"><img src="https://img.shields.io/badge/%20Modelscope-Demo-purple"></a>
     </h4>
 </div>
 
@@ -40,11 +41,12 @@ DiffuEraser is a diffusion model for video inpainting, which outperforms state-o
 ## Update Log
 - *2025.01.20*: Release inference code.
 - *2025.03.26*: Release training code.
+- *2025.04.08*: Release online demo on [ModelScope](https://www.modelscope.cn/studios/iic/DiffuEraser).
 
 
 ## TODO
 - [x] Release training code.
-- [ ] Release HuggingFace/ModelScope demo.
+- [x] Release HuggingFace/ModelScope demo.
 - [ ] Release gradio demo.
   
   
