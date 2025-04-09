@@ -19,6 +19,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from transformers import AutoTokenizer, PretrainedConfig
 
 from libs.unet_motion_model import MotionAdapter, UNetMotionModel
+# from diffusers.models.unets.unet_motion_model import MotionAdapter, UNetMotionModel
 from libs.brushnet_CA import BrushNetModel
 from libs.unet_2d_condition import UNet2DConditionModel
 from diffueraser.pipeline_diffueraser import StableDiffusionDiffuEraserPipeline
@@ -315,7 +316,7 @@ class DiffuEraser:
             latents = []
             num=4
             for i in range(0, pixel_values.shape[0], num):
-                latents.append(self.vae.encode(pixel_values[i : i + num]).latent_dist.sample())
+                latents.append(self.vae.encode(pixel_values[i : i + num].to(self.vae.dtype)).latent_dist.sample())
             latents = torch.cat(latents, dim=0)
         latents = latents * self.vae.config.scaling_factor #[(b f), c1, h, w], c1=4
         torch.cuda.empty_cache()  
@@ -361,7 +362,7 @@ class DiffuEraser:
                 video = video.float()
                 return video
             with torch.no_grad():
-                video_tensor_temp = decode_latents(latents_pre_out, weight_dtype=torch.float16)
+                video_tensor_temp = decode_latents(latents_pre_out, weight_dtype=self.vae.dtype)
                 images_pre_out  = self.image_processor.postprocess(video_tensor_temp, output_type="pil")
             torch.cuda.empty_cache()  
 

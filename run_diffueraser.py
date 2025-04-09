@@ -34,6 +34,7 @@ def main():
     # PCM params
     ckpt = "2-Step"
     video_inpainting_sd = DiffuEraser(device, args.base_model_path, args.vae_path, args.diffueraser_path, ckpt=ckpt)
+    video_inpainting_sd.pipeline.to('cpu')
     propainter = Propainter(args.propainter_model_dir, device=device)
     
     start_time = time.time()
@@ -43,6 +44,14 @@ def main():
                         ref_stride=args.ref_stride, neighbor_length=args.neighbor_length, subvideo_length = args.subvideo_length,
                         mask_dilation = args.mask_dilation_iter) 
 
+    propainter.model.cpu()
+    torch.cuda.empty_cache()
+    video_inpainting_sd.pipeline.to('cuda').to(torch.bfloat16)
+
+    video_inpainting_sd.pipeline.enable_model_cpu_offload()
+    video_inpainting_sd.pipeline.enable_xformers_memory_efficient_attention()
+    video_inpainting_sd.pipeline.enable_sequential_cpu_offload()
+    
     ## diffueraser
     guidance_scale = None    # The default value is 0.  
     video_inpainting_sd.forward(args.input_video, args.input_mask, priori_path, output_path,
