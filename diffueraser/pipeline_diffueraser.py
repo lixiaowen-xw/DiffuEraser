@@ -1338,7 +1338,9 @@ class StableDiffusionDiffuEraserPipeline(
         if output_type == "pt":
             video = video_tensor
         else:
-            video = self.image_processor.postprocess(video_tensor, output_type=output_type)
+            video = []
+            for i in range(video_tensor.shape[0]):
+                video.append(self.image_processor.postprocess(video_tensor[i:i+1], output_type=output_type)[0])
 
         # Offload all models
         self.maybe_free_model_hooks()

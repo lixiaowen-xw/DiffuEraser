@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.utils.checkpoint
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.loaders import UNet2DConditionLoadersMixin
+from diffusers.loaders import UNet2DConditionLoadersMixin, PeftAdapterMixin
 from diffusers.utils import logging, deprecate
 from diffusers.models.attention_processor import (
     ADDED_KV_ATTENTION_PROCESSORS,
@@ -167,7 +167,7 @@ class MotionAdapter(ModelMixin, ConfigMixin):
         pass
 
 
-class UNetMotionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin):
+class UNetMotionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin, PeftAdapterMixin):
     r"""
     A modified conditional 2D UNet model that takes a noisy sample, conditional state, and a timestep and returns a
     sample shaped output.
