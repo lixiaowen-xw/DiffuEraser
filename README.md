@@ -33,7 +33,9 @@
 
 DiffuEraser is a diffusion model for video inpainting, which outperforms state-of-the-art model Propainter in both content completeness and temporal consistency while maintaining acceptable efficiency.
 
- If you find our work helpful, please help star this repo🌟. Thanks! 😃
+ If you find our work helpful, please help star this repo🌟. Thanks! 😃  
+ 
+ If you're using DiffuEraser in your applications, tools, or creative ideas, feel free to share the URL on [Discussions](https://github.com/lixiaowen-xw/DiffuEraser/discussions/15).
 
 ---
 
